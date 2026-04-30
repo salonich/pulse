@@ -1,18 +1,26 @@
 package proxy
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
 	"strconv"
+	"sync/atomic"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"github.com/velorai/pulse/internal/pricing"
+
+	"github.com/velorai/pulse/internal/trace"
 )
+
+// lastDropped tracks the most recently observed sender Dropped() value so the
+// /metrics handler can compute the delta and Add() it to the counter.
+var lastDropped atomic.Uint64
 
 // Metrics exposed on :9090/metrics, scraped by the ServiceMonitor.
 var (
@@ -26,28 +34,26 @@ var (
 		Help:    "LLM request latency in milliseconds.",
 		Buckets: []float64{50, 100, 200, 500, 1000, 2000, 5000, 10000},
 	}, []string{"provider", "model"})
+
+	tracesDropped = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "pulse_traces_dropped_total",
+		Help: "Traces dropped because the async sender buffer was full.",
+	})
 )
 
 func init() {
-	prometheus.MustRegister(requestsTotal, latencyHistogram)
+	prometheus.MustRegister(requestsTotal, latencyHistogram, tracesDropped)
 }
 
 // Config holds proxy startup configuration from environment variables.
 type Config struct {
-	// ProxyAddr is the listen address for the LLM proxy (default :8888).
-	ProxyAddr string
-	// MetricsAddr is the listen address for Prometheus metrics (default :9090).
-	MetricsAddr string
-	// CollectorURL is the trace collector endpoint.
-	CollectorURL string
-	// PricingPath is the path to pricing.json ConfigMap mount.
-	PricingPath string
-	// LLMBackendNamespace is the namespace of the owning LLMBackend.
+	ProxyAddr           string
+	MetricsAddr         string
+	CollectorURL        string
 	LLMBackendNamespace string
-	// LLMBackendName is the name of the owning LLMBackend.
-	LLMBackendName string
-	// SampleRate is the fraction of traces to capture (0.0–1.0).
-	SampleRate float64
+	LLMBackendName      string
+	SampleRate          float64
+	UpstreamOverride    string
 }
 
 // ConfigFromEnv builds Config from environment variables set by the webhook injection patch.
@@ -61,11 +67,11 @@ func ConfigFromEnv() Config {
 	return Config{
 		ProxyAddr:           envOr("PULSE_PROXY_ADDR", ":8888"),
 		MetricsAddr:         envOr("PULSE_METRICS_ADDR", ":9090"),
-		CollectorURL:        envOr("PULSE_COLLECTOR_URL", "http://pulse-collector.pulse-system:9090"),
-		PricingPath:         envOr("PULSE_PRICING_PATH", "/etc/pulse/pricing.json"),
+		CollectorURL:        envOr("PULSE_COLLECTOR_URL", "http://pulse-collector.pulse-system:9091"),
 		LLMBackendNamespace: os.Getenv("PULSE_NAMESPACE"),
 		LLMBackendName:      os.Getenv("PULSE_LLMBACKEND_NAME"),
 		SampleRate:          sampleRate,
+		UpstreamOverride:    os.Getenv("PULSE_UPSTREAM_OVERRIDE"),
 	}
 }
 
@@ -76,34 +82,31 @@ func envOr(key, def string) string {
 	return def
 }
 
-// Server wires together the proxy router and the metrics server.
+// Server wires together the proxy router, metrics server, and async trace sender.
 type Server struct {
-	cfg        Config
-	pricingTable *pricing.Table
-	log        *slog.Logger
+	cfg    Config
+	log    *slog.Logger
+	sender *trace.Sender
 }
 
-// New creates a Server and loads pricing from disk (falls back to defaults on error).
+// New creates a Server and starts the trace sender's worker pool.
+// Call Shutdown to drain.
 func New(cfg Config, log *slog.Logger) *Server {
-	pt := pricing.New()
-	if cfg.PricingPath != "" {
-		if err := pt.Load(cfg.PricingPath); err != nil {
-			log.Warn("could not load pricing file, using defaults", "error", err, "path", cfg.PricingPath)
-		}
-	}
-	return &Server{cfg: cfg, pricingTable: pt, log: log}
+	sender := trace.NewSender(trace.SenderOptions{
+		CollectorURL: cfg.CollectorURL,
+	}, log)
+	return &Server{cfg: cfg, log: log, sender: sender}
 }
 
 // ProxyHandler returns the HTTP handler for the proxy listen address (:8888).
 func (s *Server) ProxyHandler() http.Handler {
-	tracer := newTracer(s.cfg.CollectorURL, s.cfg.LLMBackendNamespace, s.cfg.LLMBackendName, s.log)
-	fwd := newForwarder(s.pricingTable, tracer, s.log)
+	fwd := newForwarder(s.sender, s.cfg.LLMBackendNamespace, s.cfg.LLMBackendName, s.cfg.UpstreamOverride, s.log)
 
 	r := chi.NewRouter()
 	r.Use(middleware.Recoverer)
 	r.Use(s.metricsMiddleware)
 	r.Handle("/anthropic/*", fwd)
-	r.Handle("/openai/*", fwd) // forwarding wired; extraction in Iteration 1
+	r.Handle("/openai/*", fwd)
 
 	r.Get("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -112,28 +115,51 @@ func (s *Server) ProxyHandler() http.Handler {
 }
 
 // MetricsHandler returns the HTTP handler for the metrics listen address (:9090).
+// It also reflects the sender's drop counter into Prometheus.
 func (s *Server) MetricsHandler() http.Handler {
 	mux := http.NewServeMux()
-	mux.Handle("/metrics", promhttp.Handler())
+	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
+		// Reconcile the sender's atomic counter into the Prom counter on every scrape.
+		// Cheap and avoids a custom collector.
+		current := s.sender.Dropped()
+		// prometheus.Counter has no Set; we only ever add the delta.
+		// Track last-seen via a closure-local variable.
+		delta := current - lastDropped.Load()
+		if delta > 0 {
+			tracesDropped.Add(float64(delta))
+			lastDropped.Store(current)
+		}
+		promhttp.Handler().ServeHTTP(w, r)
+	})
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})
 	return mux
 }
 
+// Shutdown drains the trace sender with the given deadline.
+func (s *Server) Shutdown(ctx context.Context) {
+	deadline := 5 * time.Second
+	if dl, ok := ctx.Deadline(); ok {
+		if d := time.Until(dl); d < deadline {
+			deadline = d
+		}
+	}
+	s.sender.Close(deadline)
+}
+
 // metricsMiddleware updates Prometheus counters/histograms after each proxied request.
 func (s *Server) metricsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ww := middleware.NewWrapResponseWriter(w, r.ProtoMajor)
-		_, provider, _ := upstreamURL(r.URL.Path)
+		_, prov, _ := upstreamURL(r.URL.Path, "")
 
-		// Use a timer to capture latency via the histogram.
 		timer := prometheus.NewTimer(prometheus.ObserverFunc(func(v float64) {
-			latencyHistogram.WithLabelValues(provider, "").Observe(v * 1000)
+			latencyHistogram.WithLabelValues(prov, "").Observe(v * 1000)
 		}))
 		next.ServeHTTP(ww, r)
 		timer.ObserveDuration()
 
-		requestsTotal.WithLabelValues(provider, "", fmt.Sprintf("%d", ww.Status())).Inc()
+		requestsTotal.WithLabelValues(prov, "", fmt.Sprintf("%d", ww.Status())).Inc()
 	})
 }

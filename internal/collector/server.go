@@ -7,44 +7,16 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
+
 	"github.com/velorai/pulse/internal/pricing"
 	"github.com/velorai/pulse/internal/store"
+	"github.com/velorai/pulse/internal/trace"
 )
-
-// tracePayload is the JSON body expected at POST /v1/traces.
-type tracePayload struct {
-	LLMBackendNamespace string    `json:"llmbackend_namespace"`
-	LLMBackendName      string    `json:"llmbackend_name"`
-	Provider            string    `json:"provider"`
-	Model               string    `json:"model"`
-	PromptTokens        int       `json:"prompt_tokens"`
-	CompletionTokens    int       `json:"completion_tokens"`
-	LatencyMS           int       `json:"latency_ms"`
-	CostUSD             float64   `json:"cost_usd"`
-	Status              int       `json:"status"`
-	PromptVersion       string    `json:"prompt_version,omitempty"`
-	CreatedAt           time.Time `json:"created_at"`
-}
-
-func (p *tracePayload) validate() string {
-	if p.LLMBackendNamespace == "" {
-		return "llmbackend_namespace is required"
-	}
-	if p.LLMBackendName == "" {
-		return "llmbackend_name is required"
-	}
-	if p.Provider == "" {
-		return "provider is required"
-	}
-	if p.LatencyMS < 0 {
-		return "latency_ms must be non-negative"
-	}
-	return ""
-}
 
 // Server is the collector HTTP server.
 type Server struct {
@@ -65,6 +37,7 @@ func (s *Server) Handler() http.Handler {
 	r.Use(middleware.RequestID)
 
 	r.Post("/v1/traces", s.handleTrace)
+	r.Get("/v1/traces", s.handleListTraces)
 	r.Get("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})
@@ -79,46 +52,69 @@ func (s *Server) handleTrace(w http.ResponseWriter, r *http.Request) {
 	}
 	r.Body.Close()
 
-	var p tracePayload
-	if err := json.Unmarshal(body, &p); err != nil {
+	var t trace.Trace
+	if err := json.Unmarshal(body, &t); err != nil {
 		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
 		return
 	}
-	if msg := p.validate(); msg != "" {
+	if msg := t.Validate(); msg != "" {
 		http.Error(w, msg, http.StatusBadRequest)
 		return
 	}
 
-	// Server-side cost enrichment: fill in cost if proxy sent zero (unknown model).
-	if p.CostUSD == 0 && s.pricing != nil {
-		p.CostUSD = s.pricing.Calculate(p.Model, p.PromptTokens, p.CompletionTokens)
-	}
-	if p.CreatedAt.IsZero() {
-		p.CreatedAt = time.Now().UTC()
-	}
-
-	t := store.Trace{
-		LLMBackendNamespace: p.LLMBackendNamespace,
-		LLMBackendName:      p.LLMBackendName,
-		Model:               p.Model,
-		Provider:            p.Provider,
-		PromptTokens:        p.PromptTokens,
-		CompletionTokens:    p.CompletionTokens,
-		LatencyMS:           p.LatencyMS,
-		CostUSD:             p.CostUSD,
-		Status:              p.Status,
-		PromptVersion:       p.PromptVersion,
-		CreatedAt:           p.CreatedAt,
+	// Server-side cost enrichment is the single source of truth — proxies
+	// emit tokens only, the collector applies the cluster pricing table.
+	t.CostUSD = s.pricing.Calculate(t.Model, t.PromptTokens, t.CompletionTokens)
+	if t.CreatedAt.IsZero() {
+		t.CreatedAt = time.Now().UTC()
 	}
 
-	if err := s.store.InsertTrace(r.Context(), t); err != nil {
+	row := store.Trace{
+		LLMBackendNamespace: t.LLMBackendNamespace,
+		LLMBackendName:      t.LLMBackendName,
+		Model:               t.Model,
+		Provider:            t.Provider,
+		PromptTokens:        t.PromptTokens,
+		CompletionTokens:    t.CompletionTokens,
+		LatencyMS:           t.LatencyMS,
+		CostUSD:             t.CostUSD,
+		Status:              t.Status,
+		PromptVersion:       t.PromptVersion,
+		CreatedAt:           t.CreatedAt,
+	}
+
+	if err := s.store.InsertTrace(r.Context(), row); err != nil {
 		s.log.Error("failed to insert trace", "error", err,
-			"namespace", p.LLMBackendNamespace, "name", p.LLMBackendName)
+			"namespace", t.LLMBackendNamespace, "name", t.LLMBackendName)
 		http.Error(w, "storage error", http.StatusInternalServerError)
 		return
 	}
 
 	w.WriteHeader(http.StatusAccepted)
+}
+
+func (s *Server) handleListTraces(w http.ResponseWriter, r *http.Request) {
+	ns := r.URL.Query().Get("namespace")
+	if ns == "" {
+		http.Error(w, "namespace query parameter is required", http.StatusBadRequest)
+		return
+	}
+	limit := 50
+	if l := r.URL.Query().Get("limit"); l != "" {
+		if v, err := strconv.Atoi(l); err == nil && v > 0 {
+			limit = v
+		}
+	}
+
+	traces, err := s.store.ListTraces(r.Context(), ns, limit)
+	if err != nil {
+		s.log.Error("failed to list traces", "error", err, "namespace", ns)
+		http.Error(w, "storage error", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(traces)
 }
 
 // ListenAndServe starts the collector HTTP server on addr.

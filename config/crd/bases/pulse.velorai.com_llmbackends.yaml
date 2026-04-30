@@ -195,6 +195,12 @@ spec:
               observedGeneration:
                 format: int64
                 type: integer
+              sidecarInjectedPods:
+                description: |-
+                  SidecarInjectedPods is the count of pods backing TargetService that
+                  currently have the pulse-proxy container injected.
+                format: int32
+                type: integer
             type: object
         type: object
     served: true

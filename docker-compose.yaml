@@ -1,0 +1,81 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: pulse
+      POSTGRES_PASSWORD: pulse
+      POSTGRES_DB: pulse
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./deploy/migrations/000001_init.up.sql:/docker-entrypoint-initdb.d/001_init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pulse"]
+      interval: 2s
+      timeout: 3s
+      retries: 10
+
+  collector:
+    build:
+      context: .
+      dockerfile: Dockerfile.collector
+    environment:
+      # Connect as pulse_runtime (non-owner) so RLS is enforced.
+      # The pulse_runtime role is provisioned by the init migration.
+      DATABASE_URL: postgres://pulse_runtime:pulse_runtime@postgres:5432/pulse?sslmode=disable
+      COLLECTOR_ADDR: ":9091"
+    ports:
+      - "9091:9091"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  mockllm:
+    build:
+      context: .
+      dockerfile: Dockerfile.mockllm
+    ports:
+      - "8080:8080"
+
+  proxy:
+    build:
+      context: .
+      dockerfile: Dockerfile.proxy
+    environment:
+      PULSE_PROXY_ADDR: ":8888"
+      PULSE_METRICS_ADDR: ":9090"
+      PULSE_COLLECTOR_URL: "http://collector:9091"
+      PULSE_NAMESPACE: "default"
+      PULSE_LLMBACKEND_NAME: "demo"
+      PULSE_UPSTREAM_OVERRIDE: "http://mockllm:8080"
+    ports:
+      - "8888:8888"
+      - "9090:9090"
+    depends_on:
+      - collector
+      - mockllm
+
+  # eBPF capture agent. Opt-in via --profile ebpf.
+  # Replaces the proxy sidecar — applications call the LLM provider directly
+  # and this agent captures traces passively at the kernel level.
+  # Needs host PID + privileged access to load BPF programs, and host network
+  # so it can observe traffic from any process on the node.
+  ebpf-agent:
+    build:
+      context: .
+      dockerfile: Dockerfile.ebpf-agent
+    environment:
+      # Host network mode → reach collector via published port on localhost.
+      PULSE_COLLECTOR_URL: "http://localhost:9091"
+      PULSE_TARGET_PORTS: "8080,443"
+      PULSE_NAMESPACE: "default"
+      PULSE_LLMBACKEND_NAME: "ebpf-demo"
+    privileged: true
+    pid: host
+    network_mode: host
+    volumes:
+      - /sys/kernel/btf:/sys/kernel/btf:ro
+      - /sys/fs/bpf:/sys/fs/bpf
+    depends_on:
+      - collector
+    profiles: ["ebpf"]

@@ -73,18 +73,37 @@ type LLMBackendSpec struct {
 
 // LLMBackendStatus is the observed state of an LLMBackend.
 type LLMBackendStatus struct {
+	// Conditions describe the current state of each owned resource.
+	// One entry per resource (ServiceMonitor, GrafanaDashboard, ...) plus
+	// the rollup `Ready` condition.
 	// +optional
-	Conditions         []metav1.Condition `json:"conditions,omitempty" patchStrategy:"merge" patchMergeKey:"type"`
+	Conditions []metav1.Condition `json:"conditions,omitempty" patchStrategy:"merge" patchMergeKey:"type"`
+
+	// ObservedGeneration is the spec generation last reconciled.
 	// +optional
-	ObservedGeneration int64              `json:"observedGeneration,omitempty"`
+	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
+
+	// SidecarInjectedPods is the count of pods backing TargetService that
+	// currently have the pulse-proxy container injected. This is a sampled
+	// fact, not an aspiration — Ready=True requires this to be > 0 (or
+	// captureMethod=ebpf, where the eBPF DaemonSet is the truth signal).
+	// +optional
+	SidecarInjectedPods int32 `json:"sidecarInjectedPods,omitempty"`
 }
 
-// Condition type constants.
+// Condition type constants. Each owned resource has a dedicated condition
+// type set by the OwnedResource reconciler driver; Ready is the rollup.
 const (
-	ConditionSidecarInjected       = "SidecarInjected"
-	ConditionPrometheusConfigured  = "PrometheusConfigured"
+	ConditionPricingConfigMapReady = "PricingConfigMapReady"
+	ConditionServiceMonitorReady   = "ServiceMonitorReady"
 	ConditionGrafanaDashboardReady = "GrafanaDashboardReady"
+	ConditionSidecarsInjected      = "SidecarsInjected"
 	ConditionReady                 = "Ready"
+
+	// Retained for backwards compatibility with status objects written by
+	// older reconciler versions; not set by current code.
+	ConditionSidecarInjected      = "SidecarInjected"
+	ConditionPrometheusConfigured = "PrometheusConfigured"
 )
 
 // +kubebuilder:object:root=true

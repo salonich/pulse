@@ -3,10 +3,22 @@
 
 CREATE EXTENSION IF NOT EXISTS "pgcrypto";
 
+-- Runtime role used by the collector. Must NOT own any tables — RLS is bypassed
+-- for table owners, so the collector connecting as the schema owner would
+-- silently see every namespace. The bootstrap user (from POSTGRES_USER) is the
+-- owner; pulse_runtime is the runtime principal.
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'pulse_runtime') THEN
+        CREATE ROLE pulse_runtime WITH LOGIN PASSWORD 'pulse_runtime';
+    END IF;
+END
+$$;
+
 -- traces: one row per LLM API call.
 -- Partitioned by created_at (RANGE) for efficient purges at retention boundary.
 CREATE TABLE IF NOT EXISTS traces (
-    id                   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    id                   UUID NOT NULL DEFAULT gen_random_uuid(),
     llmbackend_namespace TEXT        NOT NULL,
     llmbackend_name      TEXT        NOT NULL,
     model                TEXT,
@@ -18,7 +30,8 @@ CREATE TABLE IF NOT EXISTS traces (
     status               INT         NOT NULL DEFAULT 0,
     prompt_version       TEXT,
     tags                 JSONB,
-    created_at           TIMESTAMPTZ NOT NULL DEFAULT now()
+    created_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (id, created_at)
 ) PARTITION BY RANGE (created_at);
 
 -- Initial partition covering the current month. Additional months added by CronJob.
@@ -27,8 +40,14 @@ CREATE TABLE IF NOT EXISTS traces_default PARTITION OF traces DEFAULT;
 -- Namespace-scoped access via Row-Level Security.
 ALTER TABLE traces ENABLE ROW LEVEL SECURITY;
 
+-- USING enforces the namespace filter on reads; WITH CHECK enforces it on writes
+-- so a misconfigured collector cannot insert rows it could not subsequently read.
+DROP POLICY IF EXISTS traces_ns_isolation ON traces;
 CREATE POLICY traces_ns_isolation ON traces
-    USING (llmbackend_namespace = current_setting('app.namespace', true));
+    USING (llmbackend_namespace = current_setting('app.namespace', true))
+    WITH CHECK (llmbackend_namespace = current_setting('app.namespace', true));
+
+GRANT SELECT, INSERT ON traces TO pulse_runtime;
 
 -- Indexes for dashboard query patterns.
 CREATE INDEX IF NOT EXISTS idx_traces_ns_created ON traces (llmbackend_namespace, created_at DESC);
@@ -53,5 +72,13 @@ CREATE TABLE IF NOT EXISTS metrics_hourly (
 ) PARTITION BY RANGE (hour);
 
 CREATE TABLE IF NOT EXISTS metrics_hourly_default PARTITION OF metrics_hourly DEFAULT;
+
+ALTER TABLE metrics_hourly ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS metrics_hourly_ns_isolation ON metrics_hourly;
+CREATE POLICY metrics_hourly_ns_isolation ON metrics_hourly
+    USING (llmbackend_namespace = current_setting('app.namespace', true))
+    WITH CHECK (llmbackend_namespace = current_setting('app.namespace', true));
+
+GRANT SELECT, INSERT ON metrics_hourly TO pulse_runtime;
 
 CREATE INDEX IF NOT EXISTS idx_metrics_hourly_ns ON metrics_hourly (llmbackend_namespace, llmbackend_name, hour DESC);

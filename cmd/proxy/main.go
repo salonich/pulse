@@ -55,4 +55,5 @@ func main() {
 	defer cancel()
 	_ = proxySrv.Shutdown(shutCtx)
 	_ = metricsSrv.Shutdown(shutCtx)
+	srv.Shutdown(shutCtx)
 }

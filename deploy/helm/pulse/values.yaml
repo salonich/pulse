@@ -36,6 +36,24 @@ collector:
       cpu: 200m
       memory: 128Mi
 
+# eBPF capture agent — deployed as a DaemonSet when captureMethod=ebpf.
+# Runs privileged on every node; observes LLM traffic at the kernel level.
+ebpfAgent:
+  enabled: false
+  image:
+    repository: ghcr.io/velorai/pulse-ebpf-agent
+    tag: latest
+    pullPolicy: IfNotPresent
+  # TCP destination ports to monitor (443 for HTTPS egress, 8080 for the mock).
+  targetPorts: "443"
+  resources:
+    limits:
+      cpu: 500m
+      memory: 256Mi
+    requests:
+      cpu: 100m
+      memory: 64Mi
+
 postgres:
   # Set to false to use an external Postgres and provide externalDSN.
   enabled: true

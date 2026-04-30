@@ -7,9 +7,20 @@ import (
 // PulseConfigSpec is the cluster-wide configuration for Pulse.
 // Apply one instance named `cluster-config` in `pulse-system`.
 type PulseConfigSpec struct {
+	// CaptureMethod selects how LLM traffic is observed.
+	// `sidecar` (default) injects a proxy into target pods.
+	// `ebpf` runs a node-local DaemonSet that captures traffic passively.
+	// +kubebuilder:default=sidecar
+	// +kubebuilder:validation:Enum=sidecar;ebpf
+	CaptureMethod string `json:"captureMethod,omitempty"`
+
 	// ProxyImage is the sidecar container image injected into target pods.
 	// +kubebuilder:default="ghcr.io/velorai/pulse-proxy:latest"
 	ProxyImage string `json:"proxyImage,omitempty"`
+
+	// EBPFAgentImage is the DaemonSet image used when captureMethod=ebpf.
+	// +kubebuilder:default="ghcr.io/velorai/pulse-ebpf-agent:latest"
+	EBPFAgentImage string `json:"ebpfAgentImage,omitempty"`
 
 	// CollectorEndpoint is the trace collector service URL.
 	// +kubebuilder:default="http://pulse-collector.pulse-system:9090"
@@ -19,6 +30,12 @@ type PulseConfigSpec struct {
 	// +kubebuilder:default=90
 	RetentionDays int32 `json:"retentionDays,omitempty"`
 }
+
+// Capture method enum values.
+const (
+	CaptureMethodSidecar = "sidecar"
+	CaptureMethodEBPF    = "ebpf"
+)
 
 // PulseConfigStatus reflects the observed state of the cluster config.
 type PulseConfigStatus struct {

@@ -17,20 +17,28 @@ import (
 )
 
 const (
-	proxyContainerName = "pulse-proxy"
-	injectLabel        = "pulse.velorai.com/inject"
-	injectLabelValue   = "enabled"
-	pricingCMName      = "pulse-pricing"
-	pricingCMNS        = "pulse-system"
-	defaultProxyImage  = "ghcr.io/velorai/pulse-proxy:latest"
-	defaultCollectorURL = "http://pulse-collector.pulse-system:9090"
+	proxyContainerName  = "pulse-proxy"
+	injectLabel         = "pulse.velorai.com/inject"
+	injectLabelValue    = "enabled"
+	defaultProxyImage   = "ghcr.io/velorai/pulse-proxy:latest"
+	defaultCollectorURL = "http://pulse-collector.pulse-system:9091"
 )
+
+// CaptureModeReader reports the cluster's active capture mode. The webhook
+// uses it to skip sidecar injection when the operator is in eBPF mode.
+//
+// Implemented by controller.PulseConfigReconciler in production; tests can
+// inject a static value.
+type CaptureModeReader interface {
+	Mode() string
+}
 
 // PodInjector is the admission.Handler that injects the pulse-proxy sidecar.
 type PodInjector struct {
-	Client     client.Client
-	Decoder    admission.Decoder
-	ProxyImage string
+	Client      client.Client
+	Decoder     admission.Decoder
+	ProxyImage  string
+	CaptureMode CaptureModeReader
 }
 
 // InjectDecoder satisfies admission.DecoderInjector so controller-runtime injects the decoder.
@@ -46,6 +54,15 @@ func (h *PodInjector) Handle(ctx context.Context, req admission.Request) admissi
 	pod := &corev1.Pod{}
 	if err := h.Decoder.DecodeRaw(req.Object, pod); err != nil {
 		return admission.Errored(http.StatusBadRequest, fmt.Errorf("decoding pod: %w", err))
+	}
+
+	// Step 0: capture-mode gate. In eBPF mode the cluster captures traffic at
+	// the kernel via a DaemonSet; injecting a sidecar would double-capture
+	// (and double-bill) every request.
+	if h.CaptureMode != nil {
+		if mode := h.CaptureMode.Mode(); mode == pulseaiv1alpha1.CaptureMethodEBPF {
+			return admission.Allowed("capture mode is ebpf; sidecar injection skipped")
+		}
 	}
 
 	// Step 1: Is the namespace labelled for injection?
@@ -130,30 +147,19 @@ func selectorMatches(selector, labels map[string]string) bool {
 	return true
 }
 
-// inject mutates the pod spec to add the proxy sidecar container, rewrite LLM env vars,
-// and mount the pricing ConfigMap.
+// inject mutates the pod spec to add the proxy sidecar container and rewrite
+// LLM env vars. Cost is computed by the collector, so no pricing ConfigMap is
+// mounted into the sidecar.
 func (h *PodInjector) inject(pod *corev1.Pod, backend *pulseaiv1alpha1.LLMBackend) {
 	image := h.ProxyImage
 	if image == "" {
 		image = defaultProxyImage
 	}
 
-	// Rewrite existing LLM env vars in all app containers.
 	for i := range pod.Spec.Containers {
 		rewriteLLMEnvVars(&pod.Spec.Containers[i])
 	}
 
-	// Add pricing ConfigMap volume.
-	pod.Spec.Volumes = append(pod.Spec.Volumes, corev1.Volume{
-		Name: "pulse-pricing",
-		VolumeSource: corev1.VolumeSource{
-			ConfigMap: &corev1.ConfigMapVolumeSource{
-				LocalObjectReference: corev1.LocalObjectReference{Name: pricingCMName},
-			},
-		},
-	})
-
-	// Build proxy sidecar container.
 	proxy := corev1.Container{
 		Name:  proxyContainerName,
 		Image: image,
@@ -161,10 +167,6 @@ func (h *PodInjector) inject(pod *corev1.Pod, backend *pulseaiv1alpha1.LLMBacken
 			{Name: "PULSE_COLLECTOR_URL", Value: defaultCollectorURL},
 			{Name: "PULSE_NAMESPACE", Value: backend.Namespace},
 			{Name: "PULSE_LLMBACKEND_NAME", Value: backend.Name},
-			{Name: "PULSE_PRICING_PATH", Value: "/etc/pulse/pricing.json"},
-		},
-		VolumeMounts: []corev1.VolumeMount{
-			{Name: "pulse-pricing", MountPath: "/etc/pulse", ReadOnly: true},
 		},
 		Resources: corev1.ResourceRequirements{},
 		SecurityContext: &corev1.SecurityContext{

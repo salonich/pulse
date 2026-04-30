@@ -1,12 +1,25 @@
 package webhook
 
 import (
+	"context"
+	"encoding/json"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/serializer"
+	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
+	admissionv1 "k8s.io/api/admission/v1"
 
 	pulseaiv1alpha1 "github.com/velorai/pulse/api/v1alpha1"
 )
+
+// staticMode satisfies CaptureModeReader for tests.
+type staticMode string
+
+func (s staticMode) Mode() string { return string(s) }
 
 func TestSelectorMatches(t *testing.T) {
 	tests := []struct {
@@ -77,6 +90,42 @@ func TestRewriteLLMEnvVars(t *testing.T) {
 	}
 }
 
+func TestHandle_EBPFModeSkipsInjection(t *testing.T) {
+	// In eBPF mode the webhook MUST allow the pod through unchanged.
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	codecs := serializer.NewCodecFactory(scheme)
+	decoder := admission.NewDecoder(scheme)
+	_ = codecs
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "foo", Namespace: "team-a"},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{Name: "app", Image: "myapp"}},
+		},
+	}
+	raw, _ := json.Marshal(pod)
+
+	h := &PodInjector{
+		Decoder:     decoder,
+		CaptureMode: staticMode(pulseaiv1alpha1.CaptureMethodEBPF),
+	}
+	req := admission.Request{
+		AdmissionRequest: admissionv1.AdmissionRequest{
+			UID:       types.UID("test"),
+			Namespace: "team-a",
+			Object:    runtime.RawExtension{Raw: raw},
+		},
+	}
+	resp := h.Handle(context.Background(), req)
+	if !resp.Allowed {
+		t.Fatalf("expected admission allowed, got %+v", resp)
+	}
+	if len(resp.Patches) != 0 {
+		t.Errorf("expected no JSON patches in eBPF mode, got %d", len(resp.Patches))
+	}
+}
+
 func TestInject_AddsProxyContainer(t *testing.T) {
 	h := &PodInjector{ProxyImage: "pulse-proxy:test"}
 	pod := &corev1.Pod{
@@ -109,13 +158,12 @@ func TestInject_AddsProxyContainer(t *testing.T) {
 		t.Errorf("pulse-proxy container not injected")
 	}
 
-	var foundVol bool
+	// Cost is computed server-side now; the proxy sidecar must NOT mount a
+	// pricing ConfigMap. A reappearance of this volume means we've reintroduced
+	// the dual-source-of-truth bug.
 	for _, v := range pod.Spec.Volumes {
 		if v.Name == "pulse-pricing" {
-			foundVol = true
+			t.Errorf("pulse-pricing volume should not be injected (cost is server-side)")
 		}
-	}
-	if !foundVol {
-		t.Error("pulse-pricing volume not added")
 	}
 }

@@ -1,0 +1,79 @@
+{{- if .Values.ebpfAgent.enabled }}
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "pulse.fullname" . }}-ebpf-agent
+  namespace: {{ .Values.namespaceOverride | default .Release.Namespace }}
+  labels:
+    {{- include "pulse.labels" . | nindent 4 }}
+    app.kubernetes.io/component: ebpf-agent
+spec:
+  selector:
+    matchLabels:
+      {{- include "pulse.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: ebpf-agent
+  template:
+    metadata:
+      labels:
+        {{- include "pulse.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: ebpf-agent
+    spec:
+      # BPF programs must be loaded from the node's kernel; the agent needs
+      # host PID so it can see syscalls from other pods, and host network
+      # so it observes traffic regardless of CNI.
+      hostPID: true
+      hostNetwork: true
+      # Must run as root to load BPF programs.
+      serviceAccountName: {{ .Values.serviceAccount.name }}-ebpf-agent
+      containers:
+        - name: ebpf-agent
+          image: "{{ .Values.ebpfAgent.image.repository }}:{{ .Values.ebpfAgent.image.tag }}"
+          imagePullPolicy: {{ .Values.ebpfAgent.image.pullPolicy }}
+          env:
+            - name: PULSE_COLLECTOR_URL
+              value: "http://{{ include "pulse.fullname" . }}-collector.{{ .Values.namespaceOverride | default .Release.Namespace }}:9091"
+            - name: PULSE_TARGET_PORTS
+              value: {{ .Values.ebpfAgent.targetPorts | quote }}
+            - name: PULSE_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: PULSE_LLMBACKEND_NAME
+              value: "ebpf-node-capture"
+          securityContext:
+            privileged: true
+            capabilities:
+              add:
+                - BPF
+                - SYS_ADMIN
+                - SYS_RESOURCE
+                - NET_ADMIN
+          volumeMounts:
+            - name: bpf-fs
+              mountPath: /sys/fs/bpf
+            - name: btf
+              mountPath: /sys/kernel/btf
+              readOnly: true
+          resources:
+            {{- toYaml .Values.ebpfAgent.resources | nindent 12 }}
+      volumes:
+        - name: bpf-fs
+          hostPath:
+            path: /sys/fs/bpf
+            type: DirectoryOrCreate
+        - name: btf
+          hostPath:
+            path: /sys/kernel/btf
+            type: Directory
+      tolerations:
+        - effect: NoSchedule
+          operator: Exists
+        - effect: NoExecute
+          operator: Exists
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ .Values.serviceAccount.name }}-ebpf-agent
+  namespace: {{ .Values.namespaceOverride | default .Release.Namespace }}
+{{- end }}

@@ -43,9 +43,23 @@ spec:
               PulseConfigSpec is the cluster-wide configuration for Pulse.
               Apply one instance named `cluster-config` in `pulse-system`.
             properties:
+              captureMethod:
+                default: sidecar
+                description: |-
+                  CaptureMethod selects how LLM traffic is observed.
+                  `sidecar` (default) injects a proxy into target pods.
+                  `ebpf` runs a node-local DaemonSet that captures traffic passively.
+                enum:
+                - sidecar
+                - ebpf
+                type: string
               collectorEndpoint:
                 default: http://pulse-collector.pulse-system:9090
                 description: CollectorEndpoint is the trace collector service URL.
+                type: string
+              ebpfAgentImage:
+                default: ghcr.io/velorai/pulse-ebpf-agent:latest
+                description: EBPFAgentImage is the DaemonSet image used when captureMethod=ebpf.
                 type: string
               proxyImage:
                 default: ghcr.io/velorai/pulse-proxy:latest

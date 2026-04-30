@@ -1,50 +1,55 @@
+// Package proxy implements the LLM intercepting sidecar proxy.
 package proxy
 
 import (
 	"bytes"
-	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
-	"strings"
 	"time"
 
-	"github.com/velorai/pulse/internal/pricing"
+	"github.com/velorai/pulse/internal/provider"
+	"github.com/velorai/pulse/internal/trace"
 )
 
 // upstreamURL maps the incoming path prefix to the upstream base URL.
 // /anthropic/* → https://api.anthropic.com
-// /openai/*    → https://api.openai.com  (Iteration 1)
-func upstreamURL(path string) (string, string, error) {
-	switch {
-	case strings.HasPrefix(path, "/anthropic/"):
-		tail := strings.TrimPrefix(path, "/anthropic")
-		return "https://api.anthropic.com" + tail, "anthropic", nil
-	case strings.HasPrefix(path, "/openai/"):
-		tail := strings.TrimPrefix(path, "/openai")
-		return "https://api.openai.com" + tail, "openai", nil
-	default:
+// /openai/*    → https://api.openai.com
+// If override is set, all providers route there instead.
+func upstreamURL(path, override string) (string, string, error) {
+	p, tail, ok := provider.FromPath(path)
+	if !ok {
 		return "", "", fmt.Errorf("unknown provider prefix in path %q", path)
 	}
+	base := provider.UpstreamURL(p)
+	if override != "" {
+		base = override
+	}
+	return base + tail, p, nil
 }
 
-// Forwarder handles a single LLM request: forwards it upstream, captures the trace,
-// and posts the trace to the collector asynchronously.
+// Forwarder handles a single LLM request: forwards it upstream, captures the
+// trace, and submits to the bounded async sender.
+//
+// Cost is NOT computed here — the collector is the single source of truth.
 type Forwarder struct {
-	httpClient *http.Client
-	pricing    *pricing.Table
-	tracer     *Tracer
-	log        *slog.Logger
+	httpClient       *http.Client
+	sender           *trace.Sender
+	namespace        string
+	name             string
+	upstreamOverride string
+	log              *slog.Logger
 }
 
-func newForwarder(pt *pricing.Table, tracer *Tracer, log *slog.Logger) *Forwarder {
+func newForwarder(sender *trace.Sender, namespace, name, upstreamOverride string, log *slog.Logger) *Forwarder {
 	return &Forwarder{
-		httpClient: &http.Client{Timeout: 120 * time.Second},
-		pricing:    pt,
-		tracer:     tracer,
-		log:        log,
+		httpClient:       &http.Client{Timeout: 120 * time.Second},
+		sender:           sender,
+		namespace:        namespace,
+		name:             name,
+		upstreamOverride: upstreamOverride,
+		log:              log,
 	}
 }
 
@@ -52,13 +57,12 @@ func newForwarder(pt *pricing.Table, tracer *Tracer, log *slog.Logger) *Forwarde
 func (f *Forwarder) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 
-	targetURL, provider, err := upstreamURL(r.URL.Path)
+	targetURL, prov, err := upstreamURL(r.URL.Path, f.upstreamOverride)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	// Buffer the request body so we can forward it.
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		http.Error(w, "reading body: "+err.Error(), http.StatusInternalServerError)
@@ -66,7 +70,6 @@ func (f *Forwarder) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	r.Body.Close()
 
-	// Build upstream request.
 	upReq, err := http.NewRequestWithContext(r.Context(), r.Method, targetURL, bytes.NewReader(body))
 	if err != nil {
 		http.Error(w, "building upstream request: "+err.Error(), http.StatusInternalServerError)
@@ -85,7 +88,6 @@ func (f *Forwarder) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	defer resp.Body.Close()
 
-	// Read full response body.
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
 		http.Error(w, "reading upstream response: "+err.Error(), http.StatusBadGateway)
@@ -93,7 +95,6 @@ func (f *Forwarder) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	latencyMS := int(time.Since(start).Milliseconds())
 
-	// Forward response headers + body to the app — app is unblocked here.
 	for k, vs := range resp.Header {
 		for _, v := range vs {
 			w.Header().Add(k, v)
@@ -102,44 +103,26 @@ func (f *Forwarder) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(resp.StatusCode)
 	_, _ = w.Write(respBody)
 
-	// Async trace capture — never blocks the response path.
-	go f.captureTrace(context.Background(), provider, resp.StatusCode, latencyMS, respBody)
+	f.submitTrace(prov, resp.StatusCode, latencyMS, respBody)
 }
 
-// captureTrace extracts trace fields from the upstream response body and posts to collector.
-func (f *Forwarder) captureTrace(ctx context.Context, provider string, status, latencyMS int, body []byte) {
-	var model string
-	var promptTokens, completionTokens int
+// submitTrace builds a canonical trace and submits it to the sender.
+// Non-blocking — full sender buffer drops the trace and bumps the dropped counter.
+func (f *Forwarder) submitTrace(prov string, status, latencyMS int, body []byte) {
+	model, promptTokens, completionTokens := provider.ExtractUsage(body)
 
-	switch provider {
-	case "anthropic":
-		var ar anthropicResponse
-		if err := json.Unmarshal(body, &ar); err == nil {
-			model = ar.Model
-			promptTokens = ar.Usage.InputTokens
-			completionTokens = ar.Usage.OutputTokens
-		}
-	// openai: Iteration 1
-	}
-
-	cost := f.pricing.Calculate(model, promptTokens, completionTokens)
-
-	t := Trace{
-		LLMBackendNamespace: f.tracer.namespace,
-		LLMBackendName:      f.tracer.name,
-		Provider:            provider,
+	t := trace.Trace{
+		LLMBackendNamespace: f.namespace,
+		LLMBackendName:      f.name,
+		Provider:            prov,
 		Model:               model,
 		PromptTokens:        promptTokens,
 		CompletionTokens:    completionTokens,
 		LatencyMS:           latencyMS,
-		CostUSD:             cost,
 		Status:              status,
 		CreatedAt:           time.Now().UTC(),
 	}
-
-	if err := f.tracer.Send(ctx, t); err != nil {
-		f.log.Warn("failed to send trace to collector", "error", err)
-	}
+	f.sender.Submit(t)
 }
 
 // copyHeaders copies headers from src to dst, skipping hop-by-hop headers.
