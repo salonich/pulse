@@ -1,0 +1,93 @@
+# Default values for pulse operator Helm chart.
+
+global:
+  # Image registry prefix applied to all images.
+  imageRegistry: ""
+
+operator:
+  image:
+    repository: ghcr.io/velorai/pulse-operator
+    tag: latest
+    pullPolicy: IfNotPresent
+  replicaCount: 2
+  leaderElect: true
+  proxyImage: ghcr.io/velorai/pulse-proxy:latest
+  resources:
+    limits:
+      cpu: 500m
+      memory: 256Mi
+    requests:
+      cpu: 100m
+      memory: 64Mi
+  # Extra args passed to the operator binary.
+  extraArgs: []
+
+collector:
+  image:
+    repository: ghcr.io/velorai/pulse-collector
+    tag: latest
+    pullPolicy: IfNotPresent
+  replicaCount: 2
+  resources:
+    limits:
+      cpu: 1000m
+      memory: 512Mi
+    requests:
+      cpu: 200m
+      memory: 128Mi
+
+# eBPF capture agent — deployed as a DaemonSet when captureMethod=ebpf.
+# Runs privileged on every node; observes LLM traffic at the kernel level.
+ebpfAgent:
+  enabled: false
+  image:
+    repository: ghcr.io/velorai/pulse-ebpf-agent
+    tag: latest
+    pullPolicy: IfNotPresent
+  # TCP destination ports to monitor (443 for HTTPS egress, 8080 for the mock).
+  targetPorts: "443"
+  resources:
+    limits:
+      cpu: 500m
+      memory: 256Mi
+    requests:
+      cpu: 100m
+      memory: 64Mi
+
+postgres:
+  # Set to false to use an external Postgres and provide externalDSN.
+  enabled: true
+  image:
+    repository: postgres
+    tag: "16-alpine"
+  storage: 20Gi
+  # Credentials — override with Sealed Secrets or external secret manager.
+  auth:
+    username: pulse
+    database: pulse
+    # existingSecret: pulse-postgres-creds  # Secret with key POSTGRES_PASSWORD
+
+dashboard:
+  enabled: true
+  image:
+    repository: ghcr.io/velorai/pulse-dashboard
+    tag: latest
+    pullPolicy: IfNotPresent
+  replicaCount: 2
+  ingress:
+    enabled: false
+    host: pulse.example.com
+    tlsSecretName: pulse-dashboard-tls
+
+webhook:
+  # TLS certificate for the webhook server — managed by cert-manager by default.
+  certManager:
+    enabled: true
+    issuerName: selfsigned-issuer
+
+serviceAccount:
+  create: true
+  name: pulse-operator
+
+# Namespace where the operator and its dependencies are installed.
+namespaceOverride: pulse-system

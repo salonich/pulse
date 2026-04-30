@@ -1,0 +1,27 @@
+FROM golang:1.25-bookworm AS builder
+
+# Install clang + libbpf + kernel headers so bpf2go can compile the BPF C code.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        clang \
+        llvm \
+        libbpf-dev \
+        linux-headers-amd64 \
+        libc6-dev-amd64-cross \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+
+# Regenerate BPF bindings inside the image so we always build from source,
+# then build the agent binary.
+RUN go generate ./internal/ebpf/... && \
+    CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /bin/ebpf-agent ./cmd/ebpf-agent
+
+# eBPF requires CAP_BPF / CAP_SYS_ADMIN and access to /sys/fs/bpf, so we need
+# a regular glibc-free base but NOT distroless nonroot — the agent runs as root
+# inside the DaemonSet to load kernel programs.
+FROM debian:bookworm-slim
+COPY --from=builder /bin/ebpf-agent /ebpf-agent
+ENTRYPOINT ["/ebpf-agent"]

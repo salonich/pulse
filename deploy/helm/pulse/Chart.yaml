@@ -1,0 +1,18 @@
+apiVersion: v2
+name: pulse
+description: Velorai Pulse — LLM Observability Operator for Kubernetes
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+keywords:
+  - observability
+  - llm
+  - kubernetes
+  - operator
+home: https://github.com/velorai/pulse
+sources:
+  - https://github.com/velorai/pulse
+maintainers:
+  - name: Velorai
+    email: team@velorai.com
+dependencies: []

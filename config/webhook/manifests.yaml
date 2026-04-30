@@ -1,0 +1,31 @@
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingWebhookConfiguration
+metadata:
+  name: pulse-mutating-webhook
+  labels:
+    app.kubernetes.io/name: pulse-operator
+    app.kubernetes.io/managed-by: pulse
+  annotations:
+    # cert-manager injects the CA bundle automatically.
+    cert-manager.io/inject-ca-from: pulse-system/pulse-webhook-cert
+webhooks:
+  - name: mpod.pulse.velorai.com
+    admissionReviewVersions: [v1]
+    # Fail open: pod creation always succeeds even if the webhook is unreachable.
+    failurePolicy: Ignore
+    sideEffects: None
+    clientConfig:
+      service:
+        name: pulse-webhook-service
+        namespace: pulse-system
+        path: /mutate-v1-pod
+    rules:
+      - apiGroups: [""]
+        apiVersions: [v1]
+        operations: [CREATE]
+        resources: [pods]
+        scope: Namespaced
+    # Only intercept namespaces that have opted in via the injection label.
+    namespaceSelector:
+      matchLabels:
+        pulse.velorai.com/inject: enabled

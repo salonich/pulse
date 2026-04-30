@@ -1,0 +1,61 @@
+# Example LLMBackend for a service that calls Anthropic.
+# Apply this after installing the Pulse operator.
+#
+#   kubectl apply -f https://velorai.com/pulse/operator.yaml
+#   kubectl apply -f my-llmbackend.yaml
+#
+# The operator will:
+#   1. Label the namespace for sidecar injection
+#   2. Create a pulse-pricing ConfigMap in pulse-system
+#   3. Inject the pulse-proxy sidecar into pods backing checkout-api
+#   4. Create a ServiceMonitor (Prometheus auto-scrape)
+#   5. Create a GrafanaDashboard
+#   6. Set LLMBackend status conditions
+
+apiVersion: pulse.velorai.com/v1alpha1
+kind: LLMBackend
+metadata:
+  name: checkout-anthropic
+  namespace: my-app
+spec:
+  # The service that makes LLM API calls — not the LLM provider itself.
+  # pulse-proxy is injected into the pods backing this service.
+  targetService:
+    name: checkout-api
+    namespace: my-app
+    port: 8080
+
+  providers:
+    - name: anthropic
+      backendRef:
+        name: anthropic-backend
+        namespace: pulse-system
+      credentialRef:
+        name: anthropic-api-key
+        namespace: my-app
+
+  capture:
+    enabled: true
+    includePrompts: false  # privacy off by default
+    sampleRate: "1.0"
+
+  observability:
+    prometheus: true
+    grafana: true
+    rateLimit: false  # Iteration 1
+
+  alerts:
+    - metric: cost_usd_per_hour
+      threshold: 50
+      notify: "slack://team-alerts"
+---
+# The API key Secret referenced by credentialRef above.
+# Replace <base64-encoded-key> with your actual key (base64 encoded).
+apiVersion: v1
+kind: Secret
+metadata:
+  name: anthropic-api-key
+  namespace: my-app
+type: Opaque
+data:
+  api-key: <base64-encoded-key>
