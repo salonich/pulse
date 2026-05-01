@@ -32,7 +32,7 @@ func TestLoad_OverridesDefault(t *testing.T) {
 	if _, err := f.WriteString(data); err != nil {
 		t.Fatal(err)
 	}
-	f.Close()
+	_ = f.Close()
 
 	table := New()
 	if err := table.Load(f.Name()); err != nil {
