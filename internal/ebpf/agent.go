@@ -6,7 +6,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"log/slog"
-	"net"
 	"sync"
 	"time"
 
@@ -84,7 +83,7 @@ func (a *Agent) Start(ctx context.Context) error {
 	if err := loadCaptureObjects(&a.objs, nil); err != nil {
 		return fmt.Errorf("load BPF objects: %w", err)
 	}
-	defer a.objs.Close()
+	defer func() { _ = a.objs.Close() }()
 
 	for _, p := range a.cfg.TargetPorts {
 		one := uint8(1)
@@ -119,7 +118,7 @@ func (a *Agent) Start(ctx context.Context) error {
 		return fmt.Errorf("open ringbuf: %w", err)
 	}
 	a.rb = rb
-	defer rb.Close()
+	defer func() { _ = rb.Close() }()
 
 	a.log.Info("ebpf agent started",
 		"ports", a.cfg.TargetPorts,
@@ -281,10 +280,3 @@ func (a *Agent) emitTrace(id connID, endNs uint64, ex *exchange) {
 	)
 }
 
-// ipToString converts a big-endian __be32 from BPF into a dotted string.
-// Kept for diagnostics; not currently used in the emitted trace.
-func ipToString(beIP uint32) string {
-	b := make([]byte, 4)
-	binary.BigEndian.PutUint32(b, beIP)
-	return net.IP(b).String()
-}

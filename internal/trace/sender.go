@@ -138,7 +138,7 @@ func (s *Sender) post(t Trace) {
 		s.log.Warn("post trace", "error", err)
 		return
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode >= 300 {
 		s.failed.Add(1)

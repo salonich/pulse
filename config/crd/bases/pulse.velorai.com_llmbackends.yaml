@@ -137,6 +137,10 @@ spec:
             description: LLMBackendStatus is the observed state of an LLMBackend.
             properties:
               conditions:
+                description: |-
+                  Conditions describe the current state of each owned resource.
+                  One entry per resource (ServiceMonitor, GrafanaDashboard, ...) plus
+                  the rollup `Ready` condition.
                 items:
                   description: Condition contains details for one aspect of the current
                     state of this API Resource.
@@ -193,12 +197,15 @@ spec:
                   type: object
                 type: array
               observedGeneration:
+                description: ObservedGeneration is the spec generation last reconciled.
                 format: int64
                 type: integer
               sidecarInjectedPods:
                 description: |-
                   SidecarInjectedPods is the count of pods backing TargetService that
-                  currently have the pulse-proxy container injected.
+                  currently have the pulse-proxy container injected. This is a sampled
+                  fact, not an aspiration — Ready=True requires this to be > 0 (or
+                  captureMethod=ebpf, where the eBPF DaemonSet is the truth signal).
                 format: int32
                 type: integer
             type: object

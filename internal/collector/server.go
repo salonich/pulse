@@ -50,7 +50,7 @@ func (s *Server) handleTrace(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "reading body: "+err.Error(), http.StatusBadRequest)
 		return
 	}
-	r.Body.Close()
+	_ = r.Body.Close()
 
 	var t trace.Trace
 	if err := json.Unmarshal(body, &t); err != nil {
@@ -114,7 +114,7 @@ func (s *Server) handleListTraces(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(traces)
+	_ = json.NewEncoder(w).Encode(traces)
 }
 
 // ListenAndServe starts the collector HTTP server on addr.
